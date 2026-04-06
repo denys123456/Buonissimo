@@ -1,0 +1,107 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@500;600;700;800&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top, rgba(184, 145, 85, 0.14), transparent 30%),
+    linear-gradient(180deg, #fffdf8 0%, #fcfbf7 52%, #f8f4ec 100%);
+  position: relative;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.06;
+  background-image:
+    linear-gradient(rgba(14, 14, 16, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(14, 14, 16, 0.02) 1px, transparent 1px);
+  background-size: 18px 18px;
+  mask-image: radial-gradient(circle at center, black, transparent 82%);
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.035;
+  background-image:
+    radial-gradient(circle at 20% 20%, rgba(0, 0, 0, 0.75) 0.7px, transparent 0.9px),
+    radial-gradient(circle at 80% 30%, rgba(0, 0, 0, 0.55) 0.7px, transparent 1px),
+    radial-gradient(circle at 40% 80%, rgba(0, 0, 0, 0.45) 0.8px, transparent 1px);
+  background-size: 130px 130px;
+}
+
+@layer base {
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply font-display font-semibold tracking-tight;
+  }
+
+  p {
+    @apply leading-7;
+  }
+
+  input,
+  textarea,
+  button,
+  a {
+    @apply transition duration-300;
+  }
+}
+
+@layer components {
+  .section-shell {
+    @apply px-6 py-24 lg:px-8 lg:py-28;
+  }
+
+  .section-card {
+    @apply rounded-[2rem] border border-line/80 bg-white/90 shadow-soft backdrop-blur-sm;
+  }
+
+  .glass-overlay {
+    @apply absolute inset-0 bg-gradient-to-t from-black/40 via-black/10 to-transparent opacity-0 transition duration-300 group-hover:opacity-100;
+  }
+
+  .premium-button {
+    @apply inline-flex items-center justify-center gap-2 rounded-full bg-gradient-to-r from-ink via-ink to-accent px-6 py-3 text-sm font-medium text-white shadow-glow transition duration-300 hover:-translate-y-0.5 hover:shadow-premium;
+  }
+
+  .secondary-button {
+    @apply inline-flex items-center justify-center gap-2 rounded-full border border-line bg-white/80 px-5 py-3 text-sm font-medium text-ink shadow-sm transition duration-300 hover:-translate-y-0.5 hover:border-ink hover:shadow-soft;
+  }
+
+  .premium-input {
+    @apply mt-2 w-full rounded-2xl border border-line bg-cream/90 px-4 py-3 text-ink outline-none transition duration-300 placeholder:text-ink/35 focus:border-accent focus:shadow-[0_0_0_4px_rgba(182,84,44,0.08)];
+  }
+}
+
+::selection {
+  background: rgba(182, 84, 44, 0.18);
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
