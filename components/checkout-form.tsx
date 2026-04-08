@@ -1,12 +1,12 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { loadStripe } from "@stripe/stripe-js";
 
 import { useCart } from "@/components/cart-provider";
 import { business } from "@/lib/business";
 import { haversineDistanceKm } from "@/lib/delivery";
-import { getOrderingAvailability } from "@/lib/order-hours";
+import { getOrderingAvailability, weeklySchedule } from "@/lib/order-hours";
 import type {
   CheckoutPayload,
   FulfillmentMethod,
@@ -18,6 +18,9 @@ const stripePromise = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
   ? loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY)
   : null;
 
+const GOOGLE_MAPS_API_KEY =
+  process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY?.trim() ?? "";
+
 type Status = {
   type: "idle" | "error" | "loading";
   message?: string;
@@ -27,8 +30,53 @@ type DeliveryValidationState =
   | { type: "idle"; message: "" }
   | { type: "checking"; message: "" }
   | { type: "valid"; message: "" }
-  | { type: "invalid"; message: "Adresa este în afara razei de livrare (10 km)." }
-  | { type: "error"; message: "" };
+  | { type: "too-far"; message: "Esti in afara zonei de livrare." }
+  | { type: "unverified"; message: "Locatia nu a putut fi validata automat." };
+
+type ModalState = {
+  title: string;
+  message: string;
+  primaryLabel: string;
+  secondaryLabel?: string;
+  onPrimary: () => void;
+  onSecondary?: () => void;
+};
+
+async function geocodeWithGoogle(address: string, signal: AbortSignal) {
+  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+  url.searchParams.set("address", address);
+  url.searchParams.set("key", GOOGLE_MAPS_API_KEY);
+
+  const response = await fetch(url.toString(), {
+    signal,
+    headers: {
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error("Unable to geocode the address");
+  }
+
+  const data = (await response.json()) as {
+    status: string;
+    results?: Array<{ geometry?: { location?: { lat?: number; lng?: number } } }>;
+  };
+
+  if (data.status !== "OK" || !data.results?.length) {
+    throw new Error("Unable to validate delivery distance for this address");
+  }
+
+  const location = data.results[0]?.geometry?.location;
+  const lat = Number(location?.lat);
+  const lng = Number(location?.lng);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    throw new Error("Unable to parse geocoded coordinates");
+  }
+
+  return { lat, lng };
+}
 
 export function CheckoutForm() {
   const { items, total, clearCart } = useCart();
@@ -44,6 +92,9 @@ export function CheckoutForm() {
     type: "idle",
     message: ""
   });
+  const [isDeliveryLocked, setIsDeliveryLocked] = useState(false);
+  const [modal, setModal] = useState<ModalState | null>(null);
+  const rangeModalAddressRef = useRef("");
 
   const phoneError = useMemo(() => {
     if (!phoneTouched && phone.length === 0) {
@@ -57,6 +108,23 @@ export function CheckoutForm() {
     return "";
   }, [phone, phoneTouched]);
 
+  const scheduleText = useMemo(() => weeklySchedule.join("\n"), []);
+  const helperMessage = useMemo(() => {
+    if (fulfillmentMethod !== "delivery") {
+      return "";
+    }
+
+    if (deliveryValidation.type === "checking") {
+      return "Validam automat distanta de livrare.";
+    }
+
+    if (deliveryValidation.type === "unverified") {
+      return deliveryValidation.message;
+    }
+
+    return "Livrarea este disponibila doar in raza de 10 km.";
+  }, [deliveryValidation, fulfillmentMethod]);
+
   useEffect(() => {
     const syncAvailability = () => setIsOrderingOpen(getOrderingAvailability(new Date()));
 
@@ -66,14 +134,21 @@ export function CheckoutForm() {
   }, []);
 
   useEffect(() => {
-    if (fulfillmentMethod === "pickup") {
-      setDeliveryValidation({ type: "valid", message: "" });
+    const trimmedAddress = address.trim();
+
+    if (!trimmedAddress) {
+      rangeModalAddressRef.current = "";
+      setIsDeliveryLocked(false);
+      setDeliveryValidation(
+        fulfillmentMethod === "pickup"
+          ? { type: "valid", message: "" }
+          : { type: "idle", message: "" }
+      );
       return;
     }
 
-    const trimmedAddress = address.trim();
-    if (!trimmedAddress) {
-      setDeliveryValidation({ type: "idle", message: "" });
+    if (fulfillmentMethod === "pickup" && !isDeliveryLocked) {
+      setDeliveryValidation({ type: "valid", message: "" });
       return;
     }
 
@@ -81,55 +156,75 @@ export function CheckoutForm() {
     const controller = new AbortController();
 
     const timeoutId = window.setTimeout(async () => {
-      setDeliveryValidation({ type: "checking", message: "" });
-
-      try {
-        const url = new URL("https://nominatim.openstreetmap.org/search");
-        url.searchParams.set("q", trimmedAddress);
-        url.searchParams.set("format", "jsonv2");
-        url.searchParams.set("limit", "1");
-
-        const response = await fetch(url.toString(), {
-          signal: controller.signal,
-          headers: {
-            Accept: "application/json"
-          }
-        });
-
-        if (!response.ok) {
-          throw new Error("Unable to validate address");
-        }
-
-        const data = (await response.json()) as Array<{ lat: string; lon: string }>;
+      if (!GOOGLE_MAPS_API_KEY) {
         if (!active || controller.signal.aborted) {
           return;
         }
 
-        if (!data.length) {
-          setDeliveryValidation({ type: "error", message: "" });
+        setIsDeliveryLocked(false);
+        setDeliveryValidation({
+          type: "unverified",
+          message: "Locatia nu a putut fi validata automat."
+        });
+        return;
+      }
+
+      setDeliveryValidation({ type: "checking", message: "" });
+
+      try {
+        const destination = await geocodeWithGoogle(trimmedAddress, controller.signal);
+        if (!active || controller.signal.aborted) {
           return;
         }
 
-        const distance = haversineDistanceKm(business.location, {
-          lat: Number(data[0].lat),
-          lng: Number(data[0].lon)
+        const distance = haversineDistanceKm(business.location, destination);
+        console.debug("[checkout] delivery distance", {
+          address: trimmedAddress,
+          distanceKm: Number(distance.toFixed(2)),
+          source: "google-geocode+haversine",
+          destination
         });
 
         if (distance > business.deliveryRadiusKm) {
+          setIsDeliveryLocked(true);
           setDeliveryValidation({
-            type: "invalid",
-            message: "Adresa este în afara razei de livrare (10 km)."
+            type: "too-far",
+            message: "Esti in afara zonei de livrare."
           });
+
+          if (rangeModalAddressRef.current !== trimmedAddress) {
+            rangeModalAddressRef.current = trimmedAddress;
+            setFulfillmentMethod("pickup");
+            setModal({
+              title: "Zona de livrare",
+              message:
+                "Esti in afara zonei de livrare.\nPoti continua doar cu ridicare din locatie.",
+              primaryLabel: "OK",
+              secondaryLabel: "Schimba in ridicare",
+              onPrimary: () => setModal(null),
+              onSecondary: () => {
+                setFulfillmentMethod("pickup");
+                setModal(null);
+              }
+            });
+          }
+
           return;
         }
 
+        rangeModalAddressRef.current = "";
+        setIsDeliveryLocked(false);
         setDeliveryValidation({ type: "valid", message: "" });
       } catch {
         if (!active || controller.signal.aborted) {
           return;
         }
 
-        setDeliveryValidation({ type: "error", message: "" });
+        setIsDeliveryLocked(false);
+        setDeliveryValidation({
+          type: "unverified",
+          message: "Locatia nu a putut fi validata automat."
+        });
       }
     }, 350);
 
@@ -138,14 +233,20 @@ export function CheckoutForm() {
       controller.abort();
       window.clearTimeout(timeoutId);
     };
-  }, [address, fulfillmentMethod]);
+  }, [address, fulfillmentMethod, isDeliveryLocked]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setPhoneTouched(true);
+    setStatus({ type: "idle" });
 
     if (!isOrderingOpen.canOrder) {
-      setStatus({ type: "error", message: isOrderingOpen.message });
+      setModal({
+        title: "Comenzi indisponibile",
+        message: `Momentan nu se pot plasa comenzi.\nProgram:\n${scheduleText}`,
+        primaryLabel: "OK",
+        onPrimary: () => setModal(null)
+      });
       return;
     }
 
@@ -162,18 +263,25 @@ export function CheckoutForm() {
       return;
     }
 
-    if (
-      fulfillmentMethod === "delivery" &&
-      deliveryValidation.type === "invalid"
-    ) {
-      setStatus({
-        type: "error",
-        message: "Adresa este în afara razei de livrare (10 km)."
+    if (fulfillmentMethod === "delivery" && deliveryValidation.type === "too-far") {
+      setFulfillmentMethod("pickup");
+      setModal({
+        title: "Zona de livrare",
+        message:
+          "Esti in afara zonei de livrare.\nPoti continua doar cu ridicare din locatie.",
+        primaryLabel: "OK",
+        secondaryLabel: "Schimba in ridicare",
+        onPrimary: () => setModal(null),
+        onSecondary: () => {
+          setFulfillmentMethod("pickup");
+          setModal(null);
+        }
       });
       return;
     }
 
     const form = new FormData(event.currentTarget);
+    const notes = String(form.get("notes") || "");
     const payload: CheckoutPayload = {
       items,
       fulfillmentMethod,
@@ -186,7 +294,10 @@ export function CheckoutForm() {
           fulfillmentMethod === "delivery"
             ? String(form.get("address") || "")
             : "",
-        notes: String(form.get("notes") || "")
+        notes:
+          fulfillmentMethod === "delivery" && deliveryValidation.type === "unverified"
+            ? `${notes}${notes ? "\n\n" : ""}[Distance validation: unverified]`
+            : notes
       }
     };
 
@@ -206,9 +317,16 @@ export function CheckoutForm() {
       | { url?: string; orderId?: string };
 
     if (!response.ok) {
-      setStatus({
-        type: "error",
-        message: "error" in data ? data.error : "Checkout failed"
+      const message = "error" in data ? data.error : "Checkout failed";
+      setStatus({ type: "idle" });
+      setModal({
+        title: "Comanda nu a putut fi finalizata",
+        message:
+          message === "Google Maps API key is missing"
+            ? "Locatia nu a putut fi validata automat."
+            : message,
+        primaryLabel: "OK",
+        onPrimary: () => setModal(null)
       });
       return;
     }
@@ -274,7 +392,12 @@ export function CheckoutForm() {
             name="address"
             required={fulfillmentMethod === "delivery"}
             value={address}
-            onChange={(event) => setAddress(event.target.value)}
+            onChange={(event) => {
+              setAddress(event.target.value);
+              if (isDeliveryLocked) {
+                setIsDeliveryLocked(false);
+              }
+            }}
             placeholder={
               fulfillmentMethod === "delivery"
                 ? "Street, number, city"
@@ -299,6 +422,7 @@ export function CheckoutForm() {
               <input
                 type="radio"
                 checked={fulfillmentMethod === "delivery"}
+                disabled={isDeliveryLocked}
                 onChange={() => setFulfillmentMethod("delivery")}
               />
             </label>
@@ -314,7 +438,7 @@ export function CheckoutForm() {
         </fieldset>
         <fieldset>
           <legend className="text-sm uppercase tracking-[0.24em] text-ink/45">
-            Plată
+            Plata
           </legend>
           <div className="mt-3 grid gap-3">
             <label className="flex cursor-pointer items-center justify-between rounded-3xl border border-line bg-cream/85 px-4 py-4 shadow-sm transition hover:border-ink">
@@ -341,37 +465,52 @@ export function CheckoutForm() {
           <span>Total</span>
           <span>{formatPrice(total)}</span>
         </div>
-        {fulfillmentMethod === "delivery" && deliveryValidation.type === "invalid" ? (
-          <p className="mt-5 text-sm text-accent">
-            Adresa este în afara razei de livrare (10 km).
-          </p>
-        ) : null}
         <button
           type="submit"
-          disabled={
-            status.type === "loading" ||
-            items.length === 0 ||
-            phone.length !== 10 ||
-            !isOrderingOpen.canOrder ||
-            (fulfillmentMethod === "delivery" &&
-              deliveryValidation.type === "invalid")
-          }
+          disabled={status.type === "loading" || items.length === 0 || phone.length !== 10}
           className="premium-button mt-5 flex w-full disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {paymentMethod === "card" ? "Plătește cu cardul" : "Trimite comanda"}
+          {paymentMethod === "card" ? "Plateste cu cardul" : "Trimite comanda"}
         </button>
-        {!isOrderingOpen.canOrder ? (
-          <p className="mt-4 text-sm text-accent">{isOrderingOpen.message}</p>
-        ) : null}
-        {status.type === "error" ? (
+        {status.type === "error" && status.message ? (
           <p className="mt-4 text-sm text-accent">{status.message}</p>
         ) : null}
-        {fulfillmentMethod === "delivery" ? (
-          <p className="mt-4 text-xs leading-5 text-ink/55">
-            Livrarea este validată server-side și este disponibilă doar în raza de 10 KM.
-          </p>
+        {helperMessage ? (
+          <p className="mt-4 text-xs leading-5 text-ink/55">{helperMessage}</p>
         ) : null}
       </div>
+      {modal ? (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="checkout-modal-title"
+        >
+          <div className="modal-card">
+            <p className="text-xs uppercase tracking-[0.24em] text-ink/45">Buonissimo</p>
+            <h2 id="checkout-modal-title" className="mt-3 text-2xl text-ink">
+              {modal.title}
+            </h2>
+            <p className="mt-4 whitespace-pre-line text-sm text-ink/70">
+              {modal.message}
+            </p>
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
+              {modal.secondaryLabel ? (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={modal.onSecondary}
+                >
+                  {modal.secondaryLabel}
+                </button>
+              ) : null}
+              <button type="button" className="premium-button" onClick={modal.onPrimary}>
+                {modal.primaryLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </form>
   );
 }

@@ -11,24 +11,24 @@ export function getOrderingAvailability(now = new Date()) {
   if (day === 1 || day === 2) {
     return {
       canOrder: false,
-      message: "Luni si marti suntem inchisi."
+      message: "Momentan nu se pot plasa comenzi."
     };
   }
 
-  const opensAt = 11 * 60 + 10;
-  const lastOrderAt = day >= 3 && day <= 4 ? 21 * 60 : 22 * 60;
+  const opensAt = 11 * 60;
+  const closesAt = day >= 3 && day <= 4 ? 21 * 60 + 30 : 22 * 60 + 30;
 
   if (minutes < opensAt) {
     return {
       canOrder: false,
-      message: "Comenzile se pot plasa dupa ora 11:10."
+      message: "Momentan nu se pot plasa comenzi."
     };
   }
 
-  if (minutes > lastOrderAt) {
+  if (minutes > closesAt) {
     return {
       canOrder: false,
-      message: "Ultima comanda se poate plasa cu 30 de minute inainte de inchidere."
+      message: "Momentan nu se pot plasa comenzi."
     };
   }
 
