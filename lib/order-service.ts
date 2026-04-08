@@ -1,9 +1,6 @@
 import { randomUUID } from "crypto";
 
-import { business } from "@/lib/business";
-import { haversineDistanceKm } from "@/lib/delivery";
 import { sendOrderEmail } from "@/lib/email";
-import { geocodeAddress } from "@/lib/geocode";
 import { addOrder, findOrderByStripeSession } from "@/lib/orders-store";
 import type { CheckoutPayload, StoredOrder } from "@/lib/types";
 import { calculateCartTotal } from "@/lib/utils";
@@ -17,14 +14,8 @@ export async function validateDeliveryDistance(payload: CheckoutPayload) {
     throw new Error("Delivery address is required");
   }
 
-  const customerLocation = await geocodeAddress(payload.customer.address);
-  const distanceKm = haversineDistanceKm(business.location, customerLocation);
-
-  if (distanceKm > business.deliveryRadiusKm) {
-    throw new Error("Delivery not available in your area (out of range)");
-  }
-
-  return Number(distanceKm.toFixed(2));
+  // TEMP: distance validation disabled (frontend handles delivery rules)
+  return undefined;
 }
 
 export function buildStoredOrder(
