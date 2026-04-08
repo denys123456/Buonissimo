@@ -4,8 +4,6 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { loadStripe } from "@stripe/stripe-js";
 
 import { useCart } from "@/components/cart-provider";
-import { business } from "@/lib/business";
-import { haversineDistanceKm } from "@/lib/delivery";
 import { getOrderingAvailability, weeklySchedule } from "@/lib/order-hours";
 import type {
   CheckoutPayload,
@@ -18,8 +16,21 @@ const stripePromise = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
   ? loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY)
   : null;
 
-const GOOGLE_MAPS_API_KEY =
-  process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY?.trim() ?? "";
+const ALLOWED_DELIVERY_CITIES = [
+  "Cordun",
+  "Simionesti",
+  "Pildesti",
+  "Sabaoani",
+  "Roman",
+  "Traian",
+  "Adjudeni",
+  "Tamaseni",
+  "Rachiteni",
+  "Iugani",
+  "Gheraesti",
+  "Barticesti",
+  "Botesti"
+] as const;
 
 type Status = {
   type: "idle" | "error" | "loading";
@@ -28,10 +39,8 @@ type Status = {
 
 type DeliveryValidationState =
   | { type: "idle"; message: "" }
-  | { type: "checking"; message: "" }
   | { type: "valid"; message: "" }
-  | { type: "too-far"; message: "Esti in afara zonei de livrare." }
-  | { type: "unverified"; message: "Locatia nu a putut fi validata automat." };
+  | { type: "invalid-city"; message: "Nu livram in aceasta zona." };
 
 type ModalState = {
   title: string;
@@ -42,42 +51,6 @@ type ModalState = {
   onSecondary?: () => void;
 };
 
-async function geocodeWithGoogle(address: string, signal: AbortSignal) {
-  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
-  url.searchParams.set("address", address);
-  url.searchParams.set("key", GOOGLE_MAPS_API_KEY);
-
-  const response = await fetch(url.toString(), {
-    signal,
-    headers: {
-      Accept: "application/json"
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error("Unable to geocode the address");
-  }
-
-  const data = (await response.json()) as {
-    status: string;
-    results?: Array<{ geometry?: { location?: { lat?: number; lng?: number } } }>;
-  };
-
-  if (data.status !== "OK" || !data.results?.length) {
-    throw new Error("Unable to validate delivery distance for this address");
-  }
-
-  const location = data.results[0]?.geometry?.location;
-  const lat = Number(location?.lat);
-  const lng = Number(location?.lng);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    throw new Error("Unable to parse geocoded coordinates");
-  }
-
-  return { lat, lng };
-}
-
 export function CheckoutForm() {
   const { items, total, clearCart } = useCart();
   const [status, setStatus] = useState<Status>({ type: "idle" });
@@ -85,7 +58,11 @@ export function CheckoutForm() {
     useState<FulfillmentMethod>("delivery");
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("card");
   const [phone, setPhone] = useState("");
-  const [address, setAddress] = useState("");
+  const [street, setStreet] = useState("");
+  const [streetNumber, setStreetNumber] = useState("");
+  const [postalCode, setPostalCode] = useState("");
+  const [city, setCity] = useState("");
+  const [pickupNote, setPickupNote] = useState("");
   const [phoneTouched, setPhoneTouched] = useState(false);
   const [isOrderingOpen, setIsOrderingOpen] = useState(() => getOrderingAvailability());
   const [deliveryValidation, setDeliveryValidation] = useState<DeliveryValidationState>({
@@ -109,20 +86,30 @@ export function CheckoutForm() {
   }, [phone, phoneTouched]);
 
   const scheduleText = useMemo(() => weeklySchedule.join("\n"), []);
+  const isAllowedCity = useMemo(
+    () => (city ? ALLOWED_DELIVERY_CITIES.includes(city as (typeof ALLOWED_DELIVERY_CITIES)[number]) : false),
+    [city]
+  );
+  const combinedDeliveryAddress = useMemo(() => {
+    const parts = [
+      street.trim() ? `Str. ${street.trim()}` : "",
+      streetNumber.trim() ? `Nr. ${streetNumber.trim()}` : "",
+      postalCode.trim() ? `Cod postal ${postalCode.trim()}` : "",
+      city.trim()
+    ].filter(Boolean);
+
+    return parts.join(", ");
+  }, [city, postalCode, street, streetNumber]);
   const helperMessage = useMemo(() => {
     if (fulfillmentMethod !== "delivery") {
       return "";
     }
 
-    if (deliveryValidation.type === "checking") {
-      return "Validam automat distanta de livrare.";
-    }
-
-    if (deliveryValidation.type === "unverified") {
+    if (deliveryValidation.type === "invalid-city") {
       return deliveryValidation.message;
     }
 
-    return "Livrarea este disponibila doar in raza de 10 km.";
+    return "Livrarea este disponibila doar in localitatile selectabile din lista.";
   }, [deliveryValidation, fulfillmentMethod]);
 
   useEffect(() => {
@@ -134,9 +121,7 @@ export function CheckoutForm() {
   }, []);
 
   useEffect(() => {
-    const trimmedAddress = address.trim();
-
-    if (!trimmedAddress) {
+    if (!city) {
       rangeModalAddressRef.current = "";
       setIsDeliveryLocked(false);
       setDeliveryValidation(
@@ -152,88 +137,49 @@ export function CheckoutForm() {
       return;
     }
 
-    let active = true;
-    const controller = new AbortController();
+    if (!isAllowedCity) {
+      setIsDeliveryLocked(true);
+      setDeliveryValidation({
+        type: "invalid-city",
+        message: "Nu livram in aceasta zona."
+      });
 
-    const timeoutId = window.setTimeout(async () => {
-      if (!GOOGLE_MAPS_API_KEY) {
-        if (!active || controller.signal.aborted) {
-          return;
-        }
-
-        setIsDeliveryLocked(false);
-        setDeliveryValidation({
-          type: "unverified",
-          message: "Locatia nu a putut fi validata automat."
-        });
-        return;
-      }
-
-      setDeliveryValidation({ type: "checking", message: "" });
-
-      try {
-        const destination = await geocodeWithGoogle(trimmedAddress, controller.signal);
-        if (!active || controller.signal.aborted) {
-          return;
-        }
-
-        const distance = haversineDistanceKm(business.location, destination);
-        console.debug("[checkout] delivery distance", {
-          address: trimmedAddress,
-          distanceKm: Number(distance.toFixed(2)),
-          source: "google-geocode+haversine",
-          destination
-        });
-
-        if (distance > business.deliveryRadiusKm) {
-          setIsDeliveryLocked(true);
-          setDeliveryValidation({
-            type: "too-far",
-            message: "Esti in afara zonei de livrare."
-          });
-
-          if (rangeModalAddressRef.current !== trimmedAddress) {
-            rangeModalAddressRef.current = trimmedAddress;
+      if (rangeModalAddressRef.current !== city) {
+        rangeModalAddressRef.current = city;
+        setFulfillmentMethod("pickup");
+        setModal({
+          title: "Zona de livrare",
+          message:
+            "Nu livram in aceasta zona.\nPoti continua doar cu ridicare din locatie.",
+          primaryLabel: "OK",
+          secondaryLabel: "Schimba in ridicare",
+          onPrimary: () => setModal(null),
+          onSecondary: () => {
             setFulfillmentMethod("pickup");
-            setModal({
-              title: "Zona de livrare",
-              message:
-                "Esti in afara zonei de livrare.\nPoti continua doar cu ridicare din locatie.",
-              primaryLabel: "OK",
-              secondaryLabel: "Schimba in ridicare",
-              onPrimary: () => setModal(null),
-              onSecondary: () => {
-                setFulfillmentMethod("pickup");
-                setModal(null);
-              }
-            });
+            setModal(null);
           }
-
-          return;
-        }
-
-        rangeModalAddressRef.current = "";
-        setIsDeliveryLocked(false);
-        setDeliveryValidation({ type: "valid", message: "" });
-      } catch {
-        if (!active || controller.signal.aborted) {
-          return;
-        }
-
-        setIsDeliveryLocked(false);
-        setDeliveryValidation({
-          type: "unverified",
-          message: "Locatia nu a putut fi validata automat."
         });
       }
-    }, 350);
 
-    return () => {
-      active = false;
-      controller.abort();
-      window.clearTimeout(timeoutId);
-    };
-  }, [address, fulfillmentMethod, isDeliveryLocked]);
+      return;
+    }
+
+    rangeModalAddressRef.current = "";
+    setIsDeliveryLocked(false);
+    setDeliveryValidation({ type: "valid", message: "" });
+  }, [city, fulfillmentMethod, isAllowedCity, isDeliveryLocked]);
+
+  useEffect(() => {
+    if (status.type !== "error") {
+      return;
+    }
+
+    if (fulfillmentMethod === "delivery" && !city) {
+      return;
+    }
+
+    setStatus({ type: "idle" });
+  }, [city, fulfillmentMethod, status.type, street, streetNumber, postalCode, pickupNote]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -263,12 +209,20 @@ export function CheckoutForm() {
       return;
     }
 
-    if (fulfillmentMethod === "delivery" && deliveryValidation.type === "too-far") {
+    if (fulfillmentMethod === "delivery" && (!street.trim() || !streetNumber.trim() || !city)) {
+      setStatus({
+        type: "error",
+        message: "Completeaza strada, numarul si localitatea pentru livrare."
+      });
+      return;
+    }
+
+    if (fulfillmentMethod === "delivery" && !isAllowedCity) {
       setFulfillmentMethod("pickup");
       setModal({
         title: "Zona de livrare",
         message:
-          "Esti in afara zonei de livrare.\nPoti continua doar cu ridicare din locatie.",
+          "Nu livram in aceasta zona.\nPoti continua doar cu ridicare din locatie.",
         primaryLabel: "OK",
         secondaryLabel: "Schimba in ridicare",
         onPrimary: () => setModal(null),
@@ -281,7 +235,6 @@ export function CheckoutForm() {
     }
 
     const form = new FormData(event.currentTarget);
-    const notes = String(form.get("notes") || "");
     const payload: CheckoutPayload = {
       items,
       fulfillmentMethod,
@@ -290,14 +243,8 @@ export function CheckoutForm() {
         name: String(form.get("name") || ""),
         phone,
         email: String(form.get("email") || ""),
-        address:
-          fulfillmentMethod === "delivery"
-            ? String(form.get("address") || "")
-            : "",
-        notes:
-          fulfillmentMethod === "delivery" && deliveryValidation.type === "unverified"
-            ? `${notes}${notes ? "\n\n" : ""}[Distance validation: unverified]`
-            : notes
+        address: fulfillmentMethod === "delivery" ? combinedDeliveryAddress : "",
+        notes: String(form.get("notes") || "")
       }
     };
 
@@ -321,10 +268,7 @@ export function CheckoutForm() {
       setStatus({ type: "idle" });
       setModal({
         title: "Comanda nu a putut fi finalizata",
-        message:
-          message === "Google Maps API key is missing"
-            ? "Locatia nu a putut fi validata automat."
-            : message,
+        message,
         primaryLabel: "OK",
         onPrimary: () => setModal(null)
       });
@@ -387,26 +331,70 @@ export function CheckoutForm() {
           <input type="email" name="email" required className="premium-input" />
         </label>
         <label className="text-sm text-ink/70">
-          {fulfillmentMethod === "delivery" ? "Address" : "Pickup note"}
+          {fulfillmentMethod === "delivery" ? "Street" : "Pickup note"}
           <input
-            name="address"
+            name={fulfillmentMethod === "delivery" ? "street" : "address"}
             required={fulfillmentMethod === "delivery"}
-            value={address}
+            value={fulfillmentMethod === "delivery" ? street : pickupNote}
             onChange={(event) => {
-              setAddress(event.target.value);
-              if (isDeliveryLocked) {
-                setIsDeliveryLocked(false);
+              if (fulfillmentMethod === "delivery") {
+                setStreet(event.target.value);
+              } else {
+                setPickupNote(event.target.value);
               }
             }}
-            placeholder={
-              fulfillmentMethod === "delivery"
-                ? "Street, number, city"
-                : "Optional"
-            }
+            placeholder={fulfillmentMethod === "delivery" ? "Strada" : "Optional"}
             className="premium-input"
           />
         </label>
       </div>
+      {fulfillmentMethod === "delivery" ? (
+        <div className="mt-6 grid gap-6 lg:grid-cols-3">
+          <label className="text-sm text-ink/70">
+            Number
+            <input
+              name="streetNumber"
+              required
+              value={streetNumber}
+              onChange={(event) => setStreetNumber(event.target.value)}
+              placeholder="Numar"
+              className="premium-input"
+            />
+          </label>
+          <label className="text-sm text-ink/70">
+            Postal Code
+            <input
+              name="postalCode"
+              value={postalCode}
+              onChange={(event) => setPostalCode(event.target.value)}
+              placeholder="Cod postal"
+              className="premium-input"
+            />
+          </label>
+          <label className="text-sm text-ink/70">
+            City
+            <select
+              name="city"
+              required
+              value={city}
+              onChange={(event) => {
+                setCity(event.target.value);
+                if (isDeliveryLocked) {
+                  setIsDeliveryLocked(false);
+                }
+              }}
+              className="premium-input"
+            >
+              <option value="">Selecteaza localitatea</option>
+              {ALLOWED_DELIVERY_CITIES.map((allowedCity) => (
+                <option key={allowedCity} value={allowedCity}>
+                  {allowedCity}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      ) : null}
       <label className="mt-6 block text-sm text-ink/70">
         Notes
         <textarea name="notes" rows={4} className="premium-input resize-none" />
